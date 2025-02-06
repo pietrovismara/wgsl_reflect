@@ -154,34 +154,77 @@ reflect :: proc(statements: []Any_Stmt, allocator := context.allocator) -> (Meta
 				name       = s.name,
 				group      = group,
 				binding    = binding,
-				type       = .Buffer,
 				space      = s.space,
 				access     = s.access,
 				visibility = visibility,
 			}
 
+			if strings.contains(s.type.name, "texture") {
+				info.type = .Texture
+				switch s.type.format.name {
+				case "f32":
+					info.texture.sample_type = .Float
+				case "i32":
+					info.texture.sample_type = .Sint
+				case "u32":
+					info.texture.sample_type = .Uint
+				}
+			}
+
 			// TODO: cover more types
 			switch s.type.name {
+			case "texture_1d":
+				info.texture.dimension = ._1D
 			case "texture_2d":
-				info.type = .Texture
+				info.texture.dimension = ._2D
+			case "texture_2d_array":
+				info.texture.dimension = ._2DArray
+			case "texture_3d":
+				info.texture.dimension = ._3D
+			case "texture_cube":
+				info.texture.dimension = .Cube
+			case "texture_cube_array":
+				info.texture.dimension = .CubeArray
+			case "texture_multisampled_2d":
+				info.texture.dimension = ._2D
+				info.texture.multisampled = true
+			case "texture_depth_multisampled_2d":
+				info.texture.dimension = ._2D
+				info.texture.multisampled = true
+			case "texture_depth_2d":
+				info.texture.dimension = ._2D
+			case "texture_depth_2d_array":
+				info.texture.dimension = ._2DArray
+			case "texture_depth_cube":
+				info.texture.dimension = .Cube
+			case "texture_depth_cube_array":
+				info.texture.dimension = .CubeArray
 			case "sampler":
-				fallthrough
+				info.type = .Sampler
+				info.sampler.type = .Filtering
 			case "sampler_comparison":
 				info.type = .Sampler
+				info.sampler.type = .Comparison
 			}
 
 			resources[s.name] = info
 		case ^Struct_Decl:
 		case ^Function_Decl:
-			info := Function_Info {
-				name       = s.name,
-				stage      = s.stage,
-				arguments  = s.arguments,
-				attributes = s.attributes,
-			}
-
-
 			if r_is_entry_point(s) {
+				info := Function_Info {
+					name       = s.name,
+					arguments  = s.arguments,
+					attributes = s.attributes,
+				}
+
+				if r_has_attribute(s.attributes, "vertex") {
+					info.stage = .Vertex
+				} else if r_has_attribute(s.attributes, "fragment") {
+					info.stage = .Fragment
+				} else if r_has_attribute(s.attributes, "compute") {
+					info.stage = .Compute
+				}
+
 				append(&entry_points, info)
 			}
 		}
@@ -496,7 +539,6 @@ Struct_Decl :: struct {
 Function_Decl :: struct {
 	using node:   Node,
 	name:         string,
-	stage:        wgpu.ShaderStage,
 	arguments:    []Argument,
 	attributes:   []Attribute,
 	declarations: []Var_Decl,
@@ -660,6 +702,7 @@ p_var_decl :: proc(p: ^Parser) -> Var_Decl {
 
 @(private = "package")
 p_type_decl :: proc(p: ^Parser) -> Type {
+	p_skip_attributes(p)
 	type := Type {
 		name = p_consume(p, .IDENTIFIER).text,
 	}
@@ -887,6 +930,18 @@ p_previous :: proc(p: ^Parser) -> Token {
 ~Reflection
 */
 
+Texture_Type :: struct {
+	dimension:    wgpu.TextureViewDimension,
+	sample_type:  wgpu.TextureSampleType,
+	multisampled: b32,
+}
+
+Buffer_Type :: struct {}
+
+Sampler_Type :: struct {
+	type: wgpu.SamplerBindingType,
+}
+
 Resource_Type :: enum {
 	Buffer,
 	Texture,
@@ -897,9 +952,12 @@ Resource_Info :: struct {
 	name:           string,
 	type:           Resource_Type,
 	group, binding: int,
+	visibility:     wgpu.ShaderStageFlags,
 	access:         Access_Type,
 	space:          Address_Space,
-	visibility:     wgpu.ShaderStageFlags,
+	buffer:         Buffer_Type,
+	texture:        Texture_Type,
+	sampler:        Sampler_Type,
 }
 
 Function_Info :: struct {
@@ -933,7 +991,17 @@ r_get_attribute_values :: proc(attrs: []Attribute, name: string) -> ([]string, b
 	}
 
 	return {}, false
+}
 
+@(private = "package")
+r_has_attribute :: proc(attrs: []Attribute, name: string) -> bool {
+	for attr in attrs {
+		if attr.name == name {
+			return true
+		}
+	}
+
+	return false
 }
 
 @(private = "package")
@@ -1026,20 +1094,20 @@ struct Camera {
 }
 @group(0) @binding(0) @stage(vertex) 
 var<uniform> camera: Camera;
-
 @group(1) @binding(0) @stage(vertex) 
 var<storage> transform: array<mat4x4f>;
-
-struct VertexInput {
-	@location(0) position: vec3f,
-	@location(1) normal: vec3f,
-	@location(2) uv: vec2f,
-	@builtin(instance_index) iidx: u32
-}
+@group(1) @binding(1) @stage(fragment) var tex: texture_2d<f32>;
+@group(1) @binding(2) @stage(fragment) var samp: sampler;
 
 @vertex
-fn main(@location(0) position: vec3f, @builtin(instance_index) iidx: u32) -> vec4f {	
+fn v_main(@location(0) position: vec3f, @builtin(instance_index) iidx: u32) -> vec4f {	
 	return camera.viewProjectionMatrix * transform[iidx] * vec4f(input.position, 1.0);	
+}
+
+@fragment
+fn f_main() -> @location(0) vec4f {
+	let texColor = textureSample(tex, samp, vec2f(0, 0));
+	return texColor;
 }
 `
 
@@ -1050,16 +1118,35 @@ test :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 
 	testing.expect(t, len(errs) == 0)
+	vertex_entry_point, _ := get_entry_point(metadata, .Vertex)
+	testing.expect(t, vertex_entry_point.name == "v_main")
+	fragment_entry_point, _ := get_entry_point(metadata, .Fragment)
+	testing.expect(t, fragment_entry_point.name == "f_main")
 
-	vertex_entry_point, ok := get_entry_point(metadata, .Vertex)
-	testing.expect(t, vertex_entry_point.name == "main")
+	{
+		testing.expect(t, "transform" in metadata.resources)
+		transform := metadata.resources["transform"]
+		testing.expect(t, transform.group == 1)
+		testing.expect(t, transform.binding == 0)
+		testing.expect(t, transform.type == .Buffer)
+		testing.expect(t, transform.space == .Storage)
+		testing.expect(t, transform.access == .Read)
+		testing.expect(t, transform.visibility == {.Vertex})
+	}
 
-	testing.expect(t, "transform" in metadata.resources)
-	transform := metadata.resources["transform"]
-	testing.expect(t, transform.group == 1)
-	testing.expect(t, transform.binding == 0)
-	testing.expect(t, transform.type == .Buffer)
-	testing.expect(t, transform.space == .Storage)
-	testing.expect(t, transform.access == .Read)
-	testing.expect(t, transform.visibility == {.Vertex})
+	{
+		testing.expect(t, "tex" in metadata.resources)
+		resource := metadata.resources["tex"]
+		testing.expect(t, resource.type == .Texture)
+		testing.expect(t, resource.texture.dimension == ._2D)
+		testing.expect(t, resource.texture.sample_type == .Float)
+		testing.expect(t, resource.texture.multisampled == false)
+	}
+
+	{
+		testing.expect(t, "samp" in metadata.resources)
+		resource := metadata.resources["samp"]
+		testing.expect(t, resource.type == .Sampler)
+		testing.expect(t, resource.sampler.type == .Filtering)
+	}
 }
