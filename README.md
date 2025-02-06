@@ -25,7 +25,7 @@ main :: proc() {
 	metadata, statements, tokens, errors := wgsl.process(shader, context.temp_allocator)
 	defer free_all(context.temp_allocator)
 
-    assert(len(errors) == 0)
+	assert(len(errors) == 0)
 
 	vertex_entry_point, ok := wgsl.get_entry_point(metadata, .Vertex)
 	assert(ok && vertex_entry_point.name == "main")
@@ -39,7 +39,7 @@ main :: proc() {
 	assert(transform.access == .Read)
 	assert(transform.visibility == {.Vertex})
 
-    // Strips the shader of custom attributes like @stage
-    spec_compliant_shader := wgsl.strip(shader)
+	// Strips the shader of custom attributes like @stage
+	spec_compliant_shader := wgsl.strip(shader)
 }
 ```
