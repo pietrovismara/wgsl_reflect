@@ -173,11 +173,6 @@ reflect :: proc(statements: []Any_Stmt, allocator := context.allocator) -> (Meta
 			resources[s.name] = info
 		case ^Struct_Decl:
 		case ^Function_Decl:
-			decl_map := make(map[string]struct {}, context.temp_allocator)
-			for decl in s.declarations {
-				decl_map[decl.name] = {}
-			}
-
 			info := Function_Info {
 				name       = s.name,
 				stage      = s.stage,
