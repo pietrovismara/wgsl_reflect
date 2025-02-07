@@ -154,12 +154,11 @@ reflect :: proc(statements: []Any_Stmt, allocator := context.allocator) -> (Meta
 				name       = s.name,
 				group      = group,
 				binding    = binding,
-				space      = s.space,
-				access     = s.access,
 				visibility = visibility,
 			}
 
-			if strings.contains(s.type.name, "texture") {
+			switch {
+			case strings.contains(s.type.name, "texture"):
 				info.type = .Texture
 				switch s.type.format.name {
 				case "f32":
@@ -169,43 +168,58 @@ reflect :: proc(statements: []Any_Stmt, allocator := context.allocator) -> (Meta
 				case "u32":
 					info.texture.sample_type = .Uint
 				}
+
+				switch s.type.name {
+				case "texture_1d":
+					info.texture.dimension = ._1D
+				case "texture_2d":
+					info.texture.dimension = ._2D
+				case "texture_2d_array":
+					info.texture.dimension = ._2DArray
+				case "texture_3d":
+					info.texture.dimension = ._3D
+				case "texture_cube":
+					info.texture.dimension = .Cube
+				case "texture_cube_array":
+					info.texture.dimension = .CubeArray
+				case "texture_multisampled_2d":
+					info.texture.dimension = ._2D
+					info.texture.multisampled = true
+				case "texture_depth_multisampled_2d":
+					info.texture.dimension = ._2D
+					info.texture.multisampled = true
+				case "texture_depth_2d":
+					info.texture.dimension = ._2D
+				case "texture_depth_2d_array":
+					info.texture.dimension = ._2DArray
+				case "texture_depth_cube":
+					info.texture.dimension = .Cube
+				case "texture_depth_cube_array":
+					info.texture.dimension = .CubeArray
+				}
+			case strings.contains(s.type.name, "sampler"):
+				switch s.type.name {
+				case "sampler":
+					info.type = .Sampler
+					info.sampler.type = .Filtering
+				case "sampler_comparison":
+					info.type = .Sampler
+					info.sampler.type = .Comparison
+				}
+			case:
+				info.type = .Buffer
+				#partial switch s.space {
+				case .Storage:
+					if s.access == .Read {
+						info.buffer.binding_type = .ReadOnlyStorage
+					} else {
+						info.buffer.binding_type = .Storage
+					}
+				case .Uniform:
+					info.buffer.binding_type = .Uniform
+				}
 			}
 
-			// TODO: cover more types
-			switch s.type.name {
-			case "texture_1d":
-				info.texture.dimension = ._1D
-			case "texture_2d":
-				info.texture.dimension = ._2D
-			case "texture_2d_array":
-				info.texture.dimension = ._2DArray
-			case "texture_3d":
-				info.texture.dimension = ._3D
-			case "texture_cube":
-				info.texture.dimension = .Cube
-			case "texture_cube_array":
-				info.texture.dimension = .CubeArray
-			case "texture_multisampled_2d":
-				info.texture.dimension = ._2D
-				info.texture.multisampled = true
-			case "texture_depth_multisampled_2d":
-				info.texture.dimension = ._2D
-				info.texture.multisampled = true
-			case "texture_depth_2d":
-				info.texture.dimension = ._2D
-			case "texture_depth_2d_array":
-				info.texture.dimension = ._2DArray
-			case "texture_depth_cube":
-				info.texture.dimension = .Cube
-			case "texture_depth_cube_array":
-				info.texture.dimension = .CubeArray
-			case "sampler":
-				info.type = .Sampler
-				info.sampler.type = .Filtering
-			case "sampler_comparison":
-				info.type = .Sampler
-				info.sampler.type = .Comparison
-			}
 
 			resources[s.name] = info
 		case ^Struct_Decl:
@@ -936,7 +950,9 @@ Texture_Type :: struct {
 	multisampled: b32,
 }
 
-Buffer_Type :: struct {}
+Buffer_Type :: struct {
+	binding_type: wgpu.BufferBindingType,
+}
 
 Sampler_Type :: struct {
 	type: wgpu.SamplerBindingType,
@@ -953,8 +969,6 @@ Resource_Info :: struct {
 	type:           Resource_Type,
 	group, binding: int,
 	visibility:     wgpu.ShaderStageFlags,
-	access:         Access_Type,
-	space:          Address_Space,
 	buffer:         Buffer_Type,
 	texture:        Texture_Type,
 	sampler:        Sampler_Type,
@@ -1092,16 +1106,16 @@ shader := `
 struct Camera {
 	viewProjectionMatrix: mat4x4f,
 }
-@group(0) @binding(0) @stage(vertex) 
+@group(0) @binding(0) @stage(vertex)
 var<uniform> camera: Camera;
-@group(1) @binding(0) @stage(vertex) 
+@group(1) @binding(0) @stage(vertex)
 var<storage> transform: array<mat4x4f>;
 @group(1) @binding(1) @stage(fragment) var tex: texture_2d<f32>;
 @group(1) @binding(2) @stage(fragment) var samp: sampler;
 
 @vertex
-fn v_main(@location(0) position: vec3f, @builtin(instance_index) iidx: u32) -> vec4f {	
-	return camera.viewProjectionMatrix * transform[iidx] * vec4f(input.position, 1.0);	
+fn v_main(@location(0) position: vec3f, @builtin(instance_index) iidx: u32) -> @builtin(position) vec4f {
+	return camera.viewProjectionMatrix * transform[iidx] * vec4f(input.position, 1.0);
 }
 
 @fragment
@@ -1124,13 +1138,22 @@ test :: proc(t: ^testing.T) {
 	testing.expect(t, fragment_entry_point.name == "f_main")
 
 	{
+		testing.expect(t, "camera" in metadata.resources)
+		camera := metadata.resources["camera"]
+		testing.expect(t, camera.group == 0)
+		testing.expect(t, camera.binding == 0)
+		testing.expect(t, camera.type == .Buffer)
+		testing.expect(t, camera.buffer.binding_type == .Uniform)
+		testing.expect(t, camera.visibility == {.Vertex})
+	}
+
+	{
 		testing.expect(t, "transform" in metadata.resources)
 		transform := metadata.resources["transform"]
 		testing.expect(t, transform.group == 1)
 		testing.expect(t, transform.binding == 0)
 		testing.expect(t, transform.type == .Buffer)
-		testing.expect(t, transform.space == .Storage)
-		testing.expect(t, transform.access == .Read)
+		testing.expect(t, transform.buffer.binding_type == .ReadOnlyStorage)
 		testing.expect(t, transform.visibility == {.Vertex})
 	}
 
@@ -1141,6 +1164,7 @@ test :: proc(t: ^testing.T) {
 		testing.expect(t, resource.texture.dimension == ._2D)
 		testing.expect(t, resource.texture.sample_type == .Float)
 		testing.expect(t, resource.texture.multisampled == false)
+		testing.expect(t, resource.visibility == {.Fragment})
 	}
 
 	{
@@ -1148,5 +1172,6 @@ test :: proc(t: ^testing.T) {
 		resource := metadata.resources["samp"]
 		testing.expect(t, resource.type == .Sampler)
 		testing.expect(t, resource.sampler.type == .Filtering)
+		testing.expect(t, resource.visibility == {.Fragment})
 	}
 }
