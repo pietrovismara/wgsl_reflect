@@ -48,7 +48,7 @@ main :: proc() {
 		assert(resource.group == 0)
 		assert(resource.binding == 0)
 		assert(resource.type == .Buffer)
-		assert(resource.buffer.binding_type == .Uniform)
+		assert(resource.buffer.type == .Uniform)
 		assert(resource.visibility == {.Vertex})
 	}
 
@@ -58,7 +58,7 @@ main :: proc() {
 		assert(resource.group == 1)
 		assert(resource.binding == 0)
 		assert(resource.type == .Buffer)
-		assert(resource.buffer.binding_type == .ReadOnlyStorage)
+		assert(resource.buffer.type == .ReadOnlyStorage)
 		assert(resource.visibility == {.Vertex})
 	}
 
@@ -66,8 +66,8 @@ main :: proc() {
 		assert("tex" in metadata.resources)
 		resource := metadata.resources["tex"]
 		assert(resource.type == .Texture)
-		assert(resource.texture.dimension == ._2D)
-		assert(resource.texture.sample_type == .Float)
+		assert(resource.texture.viewDimension == ._2D)
+		assert(resource.texture.sampleType == .Float)
 		assert(resource.texture.multisampled == false)
 		assert(resource.visibility == {.Fragment})
 	}
@@ -80,7 +80,13 @@ main :: proc() {
 		assert(resource.visibility == {.Fragment})
 	}
 
+	bind_group_layout_0 := generate_layout_desc(metadata, 0)
+	bind_group_layout_1 := generate_layout_desc(metadata, 1)
+
+	assert(bind_group_layout_0.entryCount == 1)
+	assert(bind_group_layout_1.entryCount == 3)
+
 	// Strips the shader of custom attributes like @stage
-	spec_compliant_shader := wgsl.strip(shader)
+	spec_compliant_shader := wgsl.comply(shader)
 }
 ```

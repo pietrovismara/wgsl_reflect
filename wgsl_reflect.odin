@@ -127,16 +127,6 @@ reflect :: proc(statements: []Any_Stmt, allocator := context.allocator) -> (Meta
 				)
 				continue
 			}
-			if !has_stages {
-				append(
-					&errors,
-					Unexpected_Value_Err {
-						msg = fmt.aprintf("Missing '@stage' attribute for resource '%v'", s.name),
-						line = s.line,
-					},
-				)
-			}
-
 
 			visibility := wgpu.ShaderStageFlags{}
 			for stage in stages {
@@ -147,6 +137,14 @@ reflect :: proc(statements: []Any_Stmt, allocator := context.allocator) -> (Meta
 					visibility += {.Fragment}
 				case "compute":
 					visibility += {.Compute}
+				case:
+					append(
+						&errors,
+						Unexpected_Value_Err {
+							msg = fmt.aprintf("Unexpected '@stage' attribute value: '%v'", stage),
+							line = s.line,
+						},
+					)
 				}
 			}
 
@@ -162,40 +160,40 @@ reflect :: proc(statements: []Any_Stmt, allocator := context.allocator) -> (Meta
 				info.type = .Texture
 				switch s.type.format.name {
 				case "f32":
-					info.texture.sample_type = .Float
+					info.texture.sampleType = .Float
 				case "i32":
-					info.texture.sample_type = .Sint
+					info.texture.sampleType = .Sint
 				case "u32":
-					info.texture.sample_type = .Uint
+					info.texture.sampleType = .Uint
 				}
 
 				switch s.type.name {
 				case "texture_1d":
-					info.texture.dimension = ._1D
+					info.texture.viewDimension = ._1D
 				case "texture_2d":
-					info.texture.dimension = ._2D
+					info.texture.viewDimension = ._2D
 				case "texture_2d_array":
-					info.texture.dimension = ._2DArray
+					info.texture.viewDimension = ._2DArray
 				case "texture_3d":
-					info.texture.dimension = ._3D
+					info.texture.viewDimension = ._3D
 				case "texture_cube":
-					info.texture.dimension = .Cube
+					info.texture.viewDimension = .Cube
 				case "texture_cube_array":
-					info.texture.dimension = .CubeArray
+					info.texture.viewDimension = .CubeArray
 				case "texture_multisampled_2d":
-					info.texture.dimension = ._2D
+					info.texture.viewDimension = ._2D
 					info.texture.multisampled = true
 				case "texture_depth_multisampled_2d":
-					info.texture.dimension = ._2D
+					info.texture.viewDimension = ._2D
 					info.texture.multisampled = true
 				case "texture_depth_2d":
-					info.texture.dimension = ._2D
+					info.texture.viewDimension = ._2D
 				case "texture_depth_2d_array":
-					info.texture.dimension = ._2DArray
+					info.texture.viewDimension = ._2DArray
 				case "texture_depth_cube":
-					info.texture.dimension = .Cube
+					info.texture.viewDimension = .Cube
 				case "texture_depth_cube_array":
-					info.texture.dimension = .CubeArray
+					info.texture.viewDimension = .CubeArray
 				}
 			case strings.contains(s.type.name, "sampler"):
 				switch s.type.name {
@@ -211,12 +209,12 @@ reflect :: proc(statements: []Any_Stmt, allocator := context.allocator) -> (Meta
 				#partial switch s.space {
 				case .Storage:
 					if s.access == .Read {
-						info.buffer.binding_type = .ReadOnlyStorage
+						info.buffer.type = .ReadOnlyStorage
 					} else {
-						info.buffer.binding_type = .Storage
+						info.buffer.type = .Storage
 					}
 				case .Uniform:
-					info.buffer.binding_type = .Uniform
+					info.buffer.type = .Uniform
 				}
 			}
 
@@ -226,9 +224,9 @@ reflect :: proc(statements: []Any_Stmt, allocator := context.allocator) -> (Meta
 		case ^Function_Decl:
 			if r_is_entry_point(s) {
 				info := Function_Info {
-					name       = s.name,
-					arguments  = s.arguments,
-					attributes = s.attributes,
+					name       = strings.clone_to_cstring(s.name, allocator),
+					arguments  = slice.clone(s.arguments, allocator), // Clone as statements could be dealloc separately
+					attributes = slice.clone(s.attributes, allocator),
 				}
 
 				if r_has_attribute(s.attributes, "vertex") {
@@ -255,16 +253,44 @@ get_entry_point :: proc(m: Metadata, stage: wgpu.ShaderStage) -> (Function_Info,
 	return {}, false
 }
 
-strip :: proc(shader: string, allocator := context.allocator) -> string {
-	return strings.concatenate(
-		strings.split_multi(
-			shader,
-			{
-				"@stage(vertex) ",
-				"@stage(fragment) ",
-				"@stage(vertex, fragment) ",
-				"@stage(compute) ",
-			},
+generate_layout_desc :: proc(
+	m: Metadata,
+	group_slot: int,
+	allocator := context.allocator,
+) -> wgpu.BindGroupLayoutDescriptor {
+	assert(group_slot <= 3)
+	entries := make([dynamic]wgpu.BindGroupLayoutEntry, allocator)
+	for name, resource in m.resources {
+		if resource.group == group_slot {
+			append(
+				&entries,
+				wgpu.BindGroupLayoutEntry {
+					binding = u32(resource.binding),
+					visibility = resource.visibility,
+					buffer = resource.buffer,
+					sampler = resource.sampler,
+					texture = resource.texture,
+				},
+			)
+		}
+	}
+
+	return {entryCount = len(entries), entries = raw_data(entries)}
+}
+
+comply :: proc(shader: string, allocator := context.allocator) -> cstring {
+	return strings.clone_to_cstring(
+		strings.concatenate(
+			strings.split_multi(
+				shader,
+				{
+					"@stage(vertex) ",
+					"@stage(fragment) ",
+					"@stage(vertex, fragment) ",
+					"@stage(compute) ",
+				},
+			),
+			allocator,
 		),
 		allocator,
 	)
@@ -392,6 +418,7 @@ s_scan_token :: proc(s: ^Scanner) {
 		}
 	case "@":
 		s_add_token(s, .ATTR)
+	case "&": // Skip
 	case " ":
 		fallthrough
 	case "\t":
@@ -636,8 +663,11 @@ p_global_decl_or_directive :: proc(p: ^Parser) -> Any_Stmt {
 @(private = "package")
 p_global_var_decl :: proc(p: ^Parser, loc := #caller_location) -> Var_Decl {
 	if !p_match(p, .VAR) do return {}
+	var_token := p_previous(p)
 
-	decl: Var_Decl
+	decl := Var_Decl {
+		line = var_token.line,
+	}
 
 	// variable_qualifier: less_than storage_class (comma access_mode)? greater_than
 	if p_match(p, .LESS) {
@@ -694,27 +724,6 @@ p_global_var_decl :: proc(p: ^Parser, loc := #caller_location) -> Var_Decl {
 }
 
 @(private = "package")
-p_var_decl :: proc(p: ^Parser) -> Var_Decl {
-	if !p_match(p, .VAR) do return {}
-
-	decl := Var_Decl {
-		name  = p_consume(p, .IDENTIFIER).text,
-		space = .Function,
-	}
-
-	if p_match(p, .COLON) {
-		decl.type = p_type_decl(p)
-	}
-	if p_match(p, .EQUAL) {
-		decl.value = p_consume_multi(p, {.NUMBER, .IDENTIFIER}).text
-	}
-
-	p_consume(p, .SEMICOLON)
-
-	return decl
-}
-
-@(private = "package")
 p_type_decl :: proc(p: ^Parser) -> Type {
 	p_skip_attributes(p)
 	type := Type {
@@ -735,9 +744,11 @@ p_type_decl :: proc(p: ^Parser) -> Type {
 @(private = "package")
 p_struct_decl :: proc(p: ^Parser) -> Struct_Decl {
 	if !p_match(p, .STRUCT) do return {}
+	struct_token := p_previous(p)
 
 	decl := Struct_Decl {
 		name = p_consume(p, .IDENTIFIER).text,
+		line = struct_token.line,
 	}
 	fields := make([dynamic]Field, p.allocator)
 
@@ -761,9 +772,11 @@ p_struct_decl :: proc(p: ^Parser) -> Struct_Decl {
 @(private = "package")
 p_function_decl :: proc(p: ^Parser) -> Function_Decl {
 	if !p_match(p, .FUNCTION) do return {}
+	fn_token := p_previous(p)
 
 	decl := Function_Decl {
 		name = p_consume(p, .IDENTIFIER).text,
+		line = fn_token.line,
 	}
 	args := make([dynamic]Argument, p.allocator)
 	declarations := make([dynamic]Var_Decl, p.allocator)
@@ -951,7 +964,7 @@ Texture_Type :: struct {
 }
 
 Buffer_Type :: struct {
-	binding_type: wgpu.BufferBindingType,
+	type: wgpu.BufferBindingType,
 }
 
 Sampler_Type :: struct {
@@ -969,13 +982,13 @@ Resource_Info :: struct {
 	type:           Resource_Type,
 	group, binding: int,
 	visibility:     wgpu.ShaderStageFlags,
-	buffer:         Buffer_Type,
-	texture:        Texture_Type,
-	sampler:        Sampler_Type,
+	buffer:         wgpu.BufferBindingLayout,
+	texture:        wgpu.TextureBindingLayout,
+	sampler:        wgpu.SamplerBindingLayout,
 }
 
 Function_Info :: struct {
-	name:       string,
+	name:       cstring,
 	stage:      wgpu.ShaderStage,
 	arguments:  []Argument,
 	attributes: []Attribute,
@@ -1143,7 +1156,7 @@ test :: proc(t: ^testing.T) {
 		testing.expect(t, camera.group == 0)
 		testing.expect(t, camera.binding == 0)
 		testing.expect(t, camera.type == .Buffer)
-		testing.expect(t, camera.buffer.binding_type == .Uniform)
+		testing.expect(t, camera.buffer.type == .Uniform)
 		testing.expect(t, camera.visibility == {.Vertex})
 	}
 
@@ -1153,7 +1166,7 @@ test :: proc(t: ^testing.T) {
 		testing.expect(t, transform.group == 1)
 		testing.expect(t, transform.binding == 0)
 		testing.expect(t, transform.type == .Buffer)
-		testing.expect(t, transform.buffer.binding_type == .ReadOnlyStorage)
+		testing.expect(t, transform.buffer.type == .ReadOnlyStorage)
 		testing.expect(t, transform.visibility == {.Vertex})
 	}
 
@@ -1161,8 +1174,8 @@ test :: proc(t: ^testing.T) {
 		testing.expect(t, "tex" in metadata.resources)
 		resource := metadata.resources["tex"]
 		testing.expect(t, resource.type == .Texture)
-		testing.expect(t, resource.texture.dimension == ._2D)
-		testing.expect(t, resource.texture.sample_type == .Float)
+		testing.expect(t, resource.texture.viewDimension == ._2D)
+		testing.expect(t, resource.texture.sampleType == .Float)
 		testing.expect(t, resource.texture.multisampled == false)
 		testing.expect(t, resource.visibility == {.Fragment})
 	}
@@ -1174,4 +1187,10 @@ test :: proc(t: ^testing.T) {
 		testing.expect(t, resource.sampler.type == .Filtering)
 		testing.expect(t, resource.visibility == {.Fragment})
 	}
+
+	layout_0 := generate_layout_desc(metadata, 0, context.temp_allocator)
+	layout_1 := generate_layout_desc(metadata, 1, context.temp_allocator)
+
+	testing.expect(t, layout_0.entryCount == 1)
+	testing.expect(t, layout_1.entryCount == 3)
 }
